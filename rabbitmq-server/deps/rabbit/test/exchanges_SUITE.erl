@@ -1,0 +1,379 @@
+%% This Source Code Form is subject to the terms of the Mozilla Public
+%% License, v. 2.0. If a copy of the MPL was not distributed with this
+%% file, You can obtain one at https://mozilla.org/MPL/2.0/.
+%%
+%% Copyright (c) 2007-2026 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
+%%
+
+-module(exchanges_SUITE).
+
+-include_lib("common_test/include/ct.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("amqp_client/include/amqp_client.hrl").
+
+-export([suite/0,
+         all/0,
+         groups/0,
+         init_per_suite/1,
+         end_per_suite/1,
+         init_per_group/2,
+         end_per_group/2,
+         init_per_testcase/2,
+         end_per_testcase/2,
+
+         delete_queues/0,
+         delete_exchange/1,
+
+         direct_exchange/1,
+         headers_exchange/1,
+         headers_exchange_key_presence_only/1,
+         topic_exchange/1,
+         fanout_exchange/1,
+         invalid_exchange/1
+        ]).
+
+suite() ->
+    [{timetrap, 5 * 60000}].
+
+all() ->
+    [
+     {group, tests}
+    ].
+
+groups() ->
+    [
+     {tests, [], all_tests()}
+    ].
+
+all_tests() ->
+    [
+     direct_exchange,
+     headers_exchange,
+     headers_exchange_key_presence_only,
+     topic_exchange,
+     fanout_exchange,
+     invalid_exchange
+    ].
+
+%% -------------------------------------------------------------------
+%% Testsuite setup/teardown.
+%% -------------------------------------------------------------------
+
+init_per_suite(Config) ->
+    rabbit_ct_helpers:log_environment(),
+    rabbit_ct_helpers:run_setup_steps(Config, []).
+
+end_per_suite(Config) ->
+    rabbit_ct_helpers:run_teardown_steps(Config).
+
+init_per_group(Group, Config) ->
+    Size = 1,
+    Config1 = rabbit_ct_helpers:set_config(Config,
+                                           [{rmq_nodes_count, Size},
+                                            {rmq_nodename_suffix, Group},
+                                            {tcp_ports_base}]),
+    rabbit_ct_helpers:run_steps(Config1, rabbit_ct_broker_helpers:setup_steps()).
+
+end_per_group(_, Config) ->
+    rabbit_ct_helpers:run_steps(Config,
+                                rabbit_ct_broker_helpers:teardown_steps()).
+
+init_per_testcase(Testcase, Config) ->
+    Config1 = rabbit_ct_helpers:testcase_started(Config, Testcase),
+    rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_queues, []),
+    Name = rabbit_data_coercion:to_binary(Testcase),
+    rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_exchange, [Name]),
+    Config2 = rabbit_ct_helpers:set_config(Config1,
+                                           [{queue_name, Name},
+                                            {alt_queue_name, <<Name/binary, "_alt">>},
+                                            {exchange_name, Name}
+                                           ]),
+    rabbit_ct_helpers:run_steps(Config2, rabbit_ct_client_helpers:setup_steps()).
+
+end_per_testcase(Testcase, Config) ->
+    rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_queues, []),
+    rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_exchange,
+                                 [?config(exchange_name, Config)]),
+    Config1 = rabbit_ct_helpers:run_steps(
+                Config,
+                rabbit_ct_client_helpers:teardown_steps()),
+    rabbit_ct_helpers:testcase_finished(Config1, Testcase).
+
+%% -------------------------------------------------------------------
+%% Testcases.
+%% -------------------------------------------------------------------
+direct_exchange(Config) ->
+    Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    Q = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', Q, 0, 0}, declare(Ch, Q, [])),
+    AltQ = ?config(alt_queue_name, Config),
+    ?assertEqual({'queue.declare_ok', AltQ, 0, 0}, declare(Ch, AltQ, [])),
+
+    Direct = <<"amq.direct">>,
+    #'queue.bind_ok'{} = amqp_channel:call(Ch, #'queue.bind'{exchange = Direct,
+                                                             queue = Q,
+                                                             routing_key = Q}),
+    #'queue.bind_ok'{} = amqp_channel:call(Ch, #'queue.bind'{exchange = Direct,
+                                                             queue = AltQ,
+                                                             routing_key = AltQ}),
+    publish(Ch, Direct, Q, <<"msg1">>),
+    publish(Ch, Direct, <<"anyotherkey">>, <<"msg2">>),
+
+    queue_utils:wait_for_messages(Config, [[Q, <<"1">>, <<"1">>, <<"0">>],
+                                                  [AltQ, <<"0">>, <<"0">>, <<"0">>]]),
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"msg1">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = Q})),
+    ?assertMatch(#'basic.get_empty'{},
+                 amqp_channel:call(Ch, #'basic.get'{queue = Q})),
+    ?assertMatch(#'basic.get_empty'{},
+                 amqp_channel:call(Ch, #'basic.get'{queue = AltQ})),
+    ok.
+
+topic_exchange(Config) ->
+    Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    Q = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', Q, 0, 0}, declare(Ch, Q, [])),
+
+    Topic = <<"amq.topic">>,
+    #'queue.bind_ok'{} = amqp_channel:call(Ch, #'queue.bind'{exchange = Topic,
+                                                             queue = Q,
+                                                             routing_key = <<"this.*.rules">>}),
+    #'queue.bind_ok'{} = amqp_channel:call(Ch, #'queue.bind'{exchange = Topic,
+                                                             queue = Q,
+                                                             routing_key = <<"*.for.*">>}),
+    #'queue.bind_ok'{} = amqp_channel:call(Ch, #'queue.bind'{exchange = Topic,
+                                                             queue = Q,
+                                                             routing_key = <<"simply#carrots">>}),
+
+    publish(Ch, Topic, <<"this.queue.rules">>, <<"msg1">>),
+    publish(Ch, Topic, <<"this.exchange.rules">>, <<"msg2">>),
+    publish(Ch, Topic, <<"another.queue.rules">>, <<"msg3">>),
+    publish(Ch, Topic, <<"carrots.for.power">>, <<"msg4">>),
+    publish(Ch, Topic, <<"simplycarrots">>, <<"msg5">>),
+    publish(Ch, Topic, <<"*.queue.rules">>, <<"msg6">>),
+
+    queue_utils:wait_for_messages(Config, [[Q, <<"3">>, <<"3">>, <<"0">>]]),
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"msg1">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = Q})),
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"msg2">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = Q})),
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"msg4">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = Q})),
+    ?assertMatch(#'basic.get_empty'{},
+                 amqp_channel:call(Ch, #'basic.get'{queue = Q})),
+
+    #'queue.bind_ok'{} = amqp_channel:call(Ch, #'queue.bind'{exchange = Topic,
+                                                             queue = Q,
+                                                             routing_key = <<"#.noclue">>}),
+    publish(Ch, Topic, <<"simplycarrots">>, <<"msg7">>),
+    queue_utils:wait_for_messages(Config, [[Q, <<"3">>, <<"0">>, <<"3">>]]),
+    publish(Ch, Topic, <<"#.bla">>, <<"msg8">>),
+    queue_utils:wait_for_messages(Config, [[Q, <<"3">>, <<"0">>, <<"3">>]]),
+    publish(Ch, Topic, <<"#.noclue">>, <<"msg9">>),
+    queue_utils:wait_for_messages(Config, [[Q, <<"4">>, <<"1">>, <<"3">>]]),
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"msg9">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = Q})),
+    ?assertMatch(#'basic.get_empty'{},
+                 amqp_channel:call(Ch, #'basic.get'{queue = Q})),
+
+    #'queue.bind_ok'{} = amqp_channel:call(Ch, #'queue.bind'{exchange = Topic,
+                                                             queue = Q,
+                                                             routing_key = <<"#">>}),
+    publish(Ch, Topic, <<"simplycarrots">>, <<"msg10">>),
+    queue_utils:wait_for_messages(Config, [[Q, <<"5">>, <<"1">>, <<"4">>]]),
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"msg10">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = Q})),
+    ?assertMatch(#'basic.get_empty'{},
+                 amqp_channel:call(Ch, #'basic.get'{queue = Q})),
+    ok.
+
+fanout_exchange(Config) ->
+    Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    Q = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', Q, 0, 0}, declare(Ch, Q, [])),
+    AltQ = ?config(alt_queue_name, Config),
+    ?assertEqual({'queue.declare_ok', AltQ, 0, 0}, declare(Ch, AltQ, [])),
+
+    Fanout = <<"amq.fanout">>,
+    #'queue.bind_ok'{} = amqp_channel:call(Ch, #'queue.bind'{exchange = Fanout,
+                                                             queue = Q,
+                                                             routing_key = Q}),
+    #'queue.bind_ok'{} = amqp_channel:call(Ch, #'queue.bind'{exchange = Fanout,
+                                                             queue = AltQ,
+                                                             routing_key = AltQ}),
+    publish(Ch, Fanout, Q, <<"msg1">>),
+    publish(Ch, Fanout, <<"anyotherkey">>, <<"msg2">>),
+
+    queue_utils:wait_for_messages(Config, [[Q, <<"2">>, <<"2">>, <<"0">>],
+                                                  [AltQ, <<"2">>, <<"2">>, <<"0">>]]),
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"msg1">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = Q})),
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"msg2">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = Q})),
+    ?assertMatch(#'basic.get_empty'{},
+                 amqp_channel:call(Ch, #'basic.get'{queue = Q})),
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"msg1">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = AltQ})),
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"msg2">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = AltQ})),
+    ?assertMatch(#'basic.get_empty'{},
+                 amqp_channel:call(Ch, #'basic.get'{queue = AltQ})),
+    ok.
+
+headers_exchange(Config) ->
+    Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    Q = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', Q, 0, 0}, declare(Ch, Q, [])),
+    AltQ = ?config(alt_queue_name, Config),
+    ?assertEqual({'queue.declare_ok', AltQ, 0, 0}, declare(Ch, AltQ, [])),
+
+    Headers = <<"amq.headers">>,
+    #'queue.bind_ok'{} =
+        amqp_channel:call(Ch,
+                          #'queue.bind'{exchange = Headers,
+                                        queue = Q,
+                                        arguments = [{<<"x-match">>, longstr, <<"all">>},
+                                                     {<<"foo">>, longstr, <<"bar">>},
+                                                     {<<"fuu">>, longstr, <<"ber">>}]
+                                       }),
+    #'queue.bind_ok'{} =
+        amqp_channel:call(Ch,
+                          #'queue.bind'{exchange = Headers,
+                                        queue = AltQ,
+                                        arguments = [{<<"x-match">>, longstr, <<"any">>},
+                                                     {<<"foo">>, longstr, <<"bar">>},
+                                                     {<<"fuu">>, longstr, <<"ber">>}]
+                                       }),
+
+    publish(Ch, Headers, <<>>, <<"msg1">>, [{<<"foo">>, longstr, <<"bar">>},
+                                            {<<"fuu">>, longstr, <<"ber">>}]),
+    publish(Ch, Headers, <<>>, <<"msg2">>, [{<<"foo">>, longstr, <<"bar">>}]),
+    publish(Ch, Headers, <<>>, <<"msg3">>),
+
+    queue_utils:wait_for_messages(Config, [[Q, <<"1">>, <<"1">>, <<"0">>],
+                                                  [AltQ, <<"2">>, <<"2">>, <<"0">>]]),
+
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"msg1">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = Q})),
+    ?assertMatch(#'basic.get_empty'{},
+                 amqp_channel:call(Ch, #'basic.get'{queue = Q})),
+
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"msg1">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = AltQ})),
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"msg2">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = AltQ})),
+    ?assertMatch(#'basic.get_empty'{},
+                 amqp_channel:call(Ch, #'basic.get'{queue = AltQ})),
+    ok.
+
+%% Test that a headers exchange routes based on the presence of a header key
+%% alone when the binding argument uses the void type, regardless of the
+%% message's header value.
+headers_exchange_key_presence_only(Config) ->
+    Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    QAll = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', QAll, 0, 0}, declare(Ch, QAll, [])),
+    QAny = ?config(alt_queue_name, Config),
+    ?assertEqual({'queue.declare_ok', QAny, 0, 0}, declare(Ch, QAny, [])),
+
+    Headers = <<"amq.headers">>,
+
+    #'queue.bind_ok'{} =
+    amqp_channel:call(Ch,
+                      #'queue.bind'{exchange = Headers,
+                                    queue = QAll,
+                                    arguments = [{<<"x-match">>, longstr, <<"all-with-x">>},
+                                                 {<<"foo">>, void, undefined},
+                                                 {<<"x-foo">>, void, undefined}]
+                                   }),
+
+    #'queue.bind_ok'{} =
+    amqp_channel:call(Ch,
+                      #'queue.bind'{exchange = Headers,
+                                    queue = QAny,
+                                    arguments = [{<<"x-match">>, longstr, <<"any-with-x">>},
+                                                 {<<"foo">>, void, undefined},
+                                                 {<<"x-foo">>, void, undefined}]
+                                   }),
+
+    %% msg1: both keys present (with arbitrary values) -> routed to both queues
+    publish(Ch, Headers, <<>>, <<"msg1">>, [{<<"foo">>, longstr, <<"anything">>},
+                                            {<<"x-foo">>, long, 42}]),
+    %% msg2: only "foo" present -> routed to QAny only
+    publish(Ch, Headers, <<>>, <<"msg2">>, [{<<"foo">>, longstr, <<"whatever">>}]),
+    %% msg3: only "x-foo" present -> routed to QAny only
+    publish(Ch, Headers, <<>>, <<"msg3">>, [{<<"x-foo">>, longstr, <<"something">>}]),
+    %% msg4: neither key present -> routed to neither queue
+    publish(Ch, Headers, <<>>, <<"msg4">>, [{<<"other">>, longstr, <<"value">>}]),
+    %% msg5: no headers at all -> routed to neither queue
+    publish(Ch, Headers, <<>>, <<"msg5">>),
+
+    queue_utils:wait_for_messages(Config, [[QAll, <<"1">>, <<"1">>, <<"0">>],
+                                           [QAny, <<"3">>, <<"3">>, <<"0">>]]),
+
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"msg1">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = QAll})),
+    ?assertMatch(#'basic.get_empty'{},
+                 amqp_channel:call(Ch, #'basic.get'{queue = QAll})),
+
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"msg1">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = QAny})),
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"msg2">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = QAny})),
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"msg3">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = QAny})),
+    ?assertMatch(#'basic.get_empty'{},
+                 amqp_channel:call(Ch, #'basic.get'{queue = QAny})),
+    ok.
+
+invalid_exchange(Config) ->
+    Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    Q = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', Q, 0, 0}, declare(Ch, Q, [])),
+
+    ?assertExit(
+       {{shutdown, {server_initiated_close, 404, _}}, _},
+       amqp_channel:call(Ch, #'queue.bind'{exchange = <<"invalid">>,
+                                           queue = Q,
+                                           routing_key = Q})).
+
+%% Internal
+
+delete_queues() ->
+    [{ok, _} = rabbit_amqqueue:delete(Q, false, false, <<"dummy">>)
+     || Q <- rabbit_amqqueue:list()].
+
+delete_exchange(Name) ->
+    ok = rabbit_exchange:ensure_deleted(
+           rabbit_misc:r(<<"/">>, exchange, Name), false, <<"dummy">>).
+
+declare(Ch, Q, Args) ->
+    declare(Ch, Q, Args, true).
+
+declare(Ch, Q, Args, Durable) ->
+    amqp_channel:call(Ch, #'queue.declare'{queue     = Q,
+                                           durable   = Durable,
+                                           auto_delete = false,
+                                           arguments = Args}).
+
+publish(Ch, X, RoutingKey, Msg) ->
+    publish(Ch, X, RoutingKey, Msg, []).
+
+publish(Ch, X, RoutingKey, Msg, Headers) ->
+    ok = amqp_channel:cast(Ch, #'basic.publish'{exchange = X,
+                                                routing_key = RoutingKey},
+                           #amqp_msg{props   = #'P_basic'{delivery_mode = 2,
+                                                          headers = Headers},
+                                     payload = Msg}).

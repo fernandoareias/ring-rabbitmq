@@ -1,0 +1,660 @@
+%% This Source Code Form is subject to the terms of the Mozilla Public
+%% License, v. 2.0. If a copy of the MPL was not distributed with this
+%% file, You can obtain one at https://mozilla.org/MPL/2.0/.
+%%
+%% Copyright (c) 2007-2026 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
+%%
+
+-module(unit_SUITE).
+
+-include_lib("common_test/include/ct.hrl").
+-include_lib("eunit/include/eunit.hrl").
+
+-include("rabbit.hrl").
+
+-import(rabbit_data_coercion, [to_map_recursive/1]).
+
+-compile(export_all).
+
+%% This cipher is listed as supported, but doesn't actually work.
+%% OTP bug: https://bugs.erlang.org/browse/ERL-1478
+-define(SKIPPED_CIPHERS, [aes_ige256]).
+
+%% OTP-26 introduced algorithms that don't play well with the test
+-define(SKIPPED_HASHES, [shake128, shake256]).
+
+all() ->
+    [
+        {group, parallel_tests},
+        {group, sequential_tests},
+        {group, gen_server2},
+        {group, date_time}
+    ].
+
+groups() ->
+    [
+        {parallel_tests, [parallel], [
+            data_coercion_as_list,
+            data_coercion_to_binary,
+            data_coercion_to_binary_rejects_unsupported_types,
+            data_coercion_to_proplist,
+            data_coercion_to_list,
+            data_coercion_to_map,
+            data_coercion_to_map_recursive_proplist,
+            data_coercion_to_map_recursive_nested_proplist,
+            data_coercion_to_map_recursive_mixed_structures,
+            data_coercion_to_map_recursive_bare_atoms,
+            data_coercion_to_map_recursive_empty_list,
+            data_coercion_to_map_recursive_list_of_maps,
+            data_coercion_to_map_recursive_deep_nesting,
+            data_coercion_to_map_recursive_atomic_values,
+            data_coercion_to_map_recursive_binary_keys,
+            data_coercion_to_map_recursive_atom_list_limitation,
+            data_coercion_atomize_keys_proplist,
+            data_coercion_atomize_keys_map,
+            data_coercion_to_boolean,
+            data_coercion_to_integer,
+            data_coercion_to_atom,
+            data_coercion_to_existing_atom,
+            data_coercion_to_existing_atom_rejects_unknown,
+            data_coercion_to_existing_atom_passthrough,
+            pget,
+            deep_pget,
+            encrypt_decrypt,
+            encrypt_decrypt_term,
+            pid_decompose_compose,
+            platform_and_version,
+            frame_encoding_does_not_fail_with_empty_binary_payload,
+            map_exception_does_not_fail_with_unicode_explaination_case1,
+            map_exception_does_not_fail_with_unicode_explaination_case2,
+            amqp_table_conversion,
+            name_type,
+            get_erl_path,
+            hexify
+        ]},
+        {sequential_tests, [], [
+            data_coercion_to_existing_atom_does_not_create_atoms
+        ]},
+        {gen_server2, [parallel], [
+            stats_timer_is_working,
+            stats_timer_writes_gen_server2_metrics_if_core_metrics_ets_exists,
+            stop_stats_timer_on_hibernation,
+            stop_stats_timer_on_backoff,
+            stop_stats_timer_on_backoff_when_backoff_less_than_stats_timeout,
+            gen_server2_stop
+        ]},
+        {date_time, [parallel], [
+            date_time_parse_duration,
+            date_time_in_the_past
+        ]}
+    ].
+
+init_per_group(_, Config) -> Config.
+end_per_group(_, Config) -> Config.
+
+init_per_testcase(_, Config) -> Config.
+
+end_per_testcase(stats_timer_is_working, Config) ->
+    reset_stats_interval(),
+    Config;
+end_per_testcase(stop_stats_timer_on_hibernation, Config) ->
+    reset_stats_interval(),
+    Config;
+end_per_testcase(stop_stats_timer_on_backoff, Config) ->
+    reset_stats_interval(),
+    Config;
+end_per_testcase(stop_stats_timer_on_backoff_when_backoff_less_than_stats_timeout, Config) ->
+    reset_stats_interval(),
+    Config;
+end_per_testcase(stats_timer_writes_gen_server2_metrics_if_core_metrics_ets_exists, Config) ->
+    rabbit_core_metrics:terminate(),
+    reset_stats_interval(),
+    Config;
+end_per_testcase(_, Config) -> Config.
+
+stats_timer_is_working(_) ->
+    StatsInterval = 300,
+    set_stats_interval(StatsInterval),
+
+    {ok, TestServer} = gen_server2_test_server:start_link(count_stats),
+    %% Start the emission
+    % TestServer ! emit_gen_server2_stats,
+
+    timer:sleep(StatsInterval * 4 + 100),
+    StatsCount = gen_server2_test_server:stats_count(TestServer),
+    ?assertEqual(4, StatsCount).
+
+stats_timer_writes_gen_server2_metrics_if_core_metrics_ets_exists(_) ->
+    rabbit_core_metrics:init(),
+
+    StatsInterval = 300,
+    set_stats_interval(StatsInterval),
+
+    {ok, TestServer} = gen_server2_test_server:start_link(),
+    timer:sleep(StatsInterval * 4),
+
+    %% No messages in the buffer
+    ?assertEqual(0, rabbit_core_metrics:get_gen_server2_stats(TestServer)),
+
+    %% Sleep to accumulate messages
+    gen_server2:cast(TestServer, {sleep, StatsInterval + 100}),
+
+    %% Sleep to get results
+    gen_server2:cast(TestServer, {sleep, 1000}),
+    gen_server2:cast(TestServer, ignore),
+    gen_server2:cast(TestServer, ignore),
+    gen_server2:cast(TestServer, ignore),
+
+    timer:sleep(StatsInterval + 150),
+    ?assertEqual(4, rabbit_core_metrics:get_gen_server2_stats(TestServer)).
+
+stop_stats_timer_on_hibernation(_) ->
+    StatsInterval = 300,
+    set_stats_interval(StatsInterval),
+
+    %% No backoff configured
+    {ok, TestServer} = gen_server2_test_server:start_link(count_stats),
+
+    ?assertEqual(ok, gen_server2:call(TestServer, hibernate)),
+
+    timer:sleep(50),
+
+    ?assertEqual({current_function,{erlang, hibernate, 3}},
+                 erlang:process_info(TestServer, current_function)),
+
+    timer:sleep(StatsInterval * 6 + 100),
+    StatsCount1 = gen_server2_test_server:stats_count(TestServer),
+    %% The timer was stopped. No stats collected
+    %% The count is 1 because hibernation emits stats
+    ?assertEqual(1, StatsCount1),
+
+    %% A message will wake up the process
+    gen_server2:call(TestServer, wake_up),
+    gen_server2:call(TestServer, wake_up),
+    gen_server2:call(TestServer, wake_up),
+
+    timer:sleep(StatsInterval * 4 + 100),
+    StatsCount5 = gen_server2_test_server:stats_count(TestServer),
+    ?assertEqual(5, StatsCount5),
+    ?assertEqual(ok, gen_server2:call(TestServer, hibernate)),
+
+    timer:sleep(50),
+
+    {current_function,{erlang,hibernate,3}} =
+        erlang:process_info(TestServer, current_function),
+
+    timer:sleep(StatsInterval * 4 + 100),
+    StatsCount6 = gen_server2_test_server:stats_count(TestServer),
+    %% The timer was stopped. No stats collected
+    %% The count is 1 because hibernation emits stats
+    6 = StatsCount6.
+
+stop_stats_timer_on_backoff(_) ->
+    StatsInterval = 300,
+    set_stats_interval(StatsInterval),
+
+    Backoff = 1000,
+    {ok, TestServer} =
+        gen_server2_test_server:start_link(
+            count_stats,
+            {backoff, Backoff, Backoff, 10000}),
+
+    ok = gen_server2:call(TestServer, hibernate),
+
+    {current_function,{gen_server2,process_next_msg,1}} =
+        erlang:process_info(TestServer, current_function),
+
+    %% Receiving messages during backoff period does not emit stats
+    timer:sleep(Backoff div 2),
+    ok = gen_server2:call(TestServer, hibernate),
+
+    timer:sleep(Backoff div 2 + 50),
+    ?assertEqual({current_function,{gen_server2,process_next_msg,1}},
+                 erlang:process_info(TestServer, current_function)),
+
+    %% Hibernate after backoff time after last message
+    timer:sleep(Backoff div 2),
+    ?assertEqual({current_function,{erlang,hibernate,3}},
+                 erlang:process_info(TestServer, current_function)),
+
+    timer:sleep(StatsInterval * 4 + 100),
+    StatsCount = gen_server2_test_server:stats_count(TestServer),
+    %% The timer was stopped. No stats collected
+    %% The count is 1 because hibernation emits stats
+    ?assertEqual(1, StatsCount),
+
+    %% A message will wake up the process
+    gen_server2:call(TestServer, wake_up),
+
+    timer:sleep(StatsInterval * 4 + 100),
+    StatsCount5 = gen_server2_test_server:stats_count(TestServer),
+    ?assertEqual(5, StatsCount5).
+
+stop_stats_timer_on_backoff_when_backoff_less_than_stats_timeout(_) ->
+    StatsInterval = 300,
+    set_stats_interval(StatsInterval),
+
+    Backoff = 200,
+    {ok, TestServer} =
+        gen_server2_test_server:start_link(
+            count_stats,
+            {backoff, Backoff, Backoff, 10000}),
+
+    ?assertEqual(ok, gen_server2:call(TestServer, hibernate)),
+
+    ?assertEqual({current_function, {gen_server2, process_next_msg, 1}},
+        erlang:process_info(TestServer, current_function)),
+
+    timer:sleep(Backoff + 50),
+
+    ?assertEqual({current_function, {erlang, hibernate, 3}},
+                 erlang:process_info(TestServer, current_function)),
+
+    timer:sleep(StatsInterval * 4 + 100),
+    StatsCount = gen_server2_test_server:stats_count(TestServer),
+    %% The timer was stopped. No stats collected
+    %% The count is 1 because hibernation emits stats
+    ?assertEqual(1, StatsCount),
+
+    %% A message will wake up the process
+    gen_server2:call(TestServer, wake_up),
+
+    timer:sleep(StatsInterval * 4 + 100),
+    StatsCount5 = gen_server2_test_server:stats_count(TestServer),
+    ?assertEqual(5, StatsCount5).
+
+gen_server2_stop(_) ->
+    {ok, TestServer} = gen_server2_test_server:start_link(),
+    ?assertEqual(ok, gen_server2:stop(TestServer)),
+    ?assertEqual(false, erlang:is_process_alive(TestServer)),
+    ?assertEqual({'EXIT', noproc}, (catch gen_server:stop(TestServer))),
+    ok.
+
+platform_and_version(_Config) ->
+    MajorVersion = erlang:system_info(otp_release),
+    Result = rabbit_misc:platform_and_version(),
+    RegExp = "^Erlang/OTP\s" ++ MajorVersion,
+    case re:run(Result, RegExp) of
+        nomatch -> ct:fail("~tp does not match ~tp", [Result, RegExp]);
+        {error, ErrType} -> ct:fail("~tp", [ErrType]);
+        _ -> ok
+    end.
+
+data_coercion_to_map(_Config) ->
+    ?assertEqual(#{a => 1}, rabbit_data_coercion:to_map([{a, 1}])),
+    ?assertEqual(#{a => 1}, rabbit_data_coercion:to_map(#{a => 1})).
+
+data_coercion_to_proplist(_Config) ->
+    ?assertEqual([{a, 1}], rabbit_data_coercion:to_proplist([{a, 1}])),
+    ?assertEqual([{a, 1}], rabbit_data_coercion:to_proplist(#{a => 1})).
+
+data_coercion_atomize_keys_map(_Config) ->
+    A = #{a => 1, b => 2, c => 3},
+    B = rabbit_data_coercion:atomize_keys(#{a => 1, "b" => 2, <<"c">> => 3}),
+    ?assertEqual(A, B).
+
+data_coercion_atomize_keys_proplist(_Config) ->
+    A = [{a, 1}, {b, 2}, {c, 3}],
+    B = rabbit_data_coercion:atomize_keys([{a, 1}, {"b", 2}, {<<"c">>, 3}]),
+    ?assertEqual(lists:usort(A), lists:usort(B)).
+
+data_coercion_to_integer(_Config) ->
+    %% Integers pass through unchanged
+    ?assertEqual(42, rabbit_data_coercion:to_integer(42)),
+    ?assertEqual(-100, rabbit_data_coercion:to_integer(-100)),
+    %% Strings (lists) are parsed
+    ?assertEqual(42, rabbit_data_coercion:to_integer("42")),
+    ?assertEqual(-100, rabbit_data_coercion:to_integer("-100")),
+    %% Binaries are parsed
+    ?assertEqual(42, rabbit_data_coercion:to_integer(<<"42">>)),
+    ?assertEqual(-100, rabbit_data_coercion:to_integer(<<"-100">>)).
+
+data_coercion_to_atom(_Config) ->
+    %% Atoms pass through unchanged
+    ?assertEqual(hello, rabbit_data_coercion:to_atom(hello)),
+    %% Strings (lists) are converted
+    ?assertEqual(hello, rabbit_data_coercion:to_atom("hello")),
+    %% Binaries are converted with utf8 encoding
+    ?assertEqual(hello, rabbit_data_coercion:to_atom(<<"hello">>)),
+    %% to_atom/2 with explicit encoding
+    ?assertEqual(hello, rabbit_data_coercion:to_atom(<<"hello">>, utf8)),
+    ?assertEqual(hello, rabbit_data_coercion:to_atom(<<"hello">>, latin1)).
+
+data_coercion_to_existing_atom(_Config) ->
+    promotable = rabbit_data_coercion:to_existing_atom(<<"promotable">>),
+    non_voter  = rabbit_data_coercion:to_existing_atom(<<"non_voter">>),
+    voter      = rabbit_data_coercion:to_existing_atom(<<"voter">>),
+    all        = rabbit_data_coercion:to_existing_atom(<<"all">>),
+    even       = rabbit_data_coercion:to_existing_atom(<<"even">>),
+    %% List (string) inputs
+    promotable = rabbit_data_coercion:to_existing_atom("promotable"),
+    all        = rabbit_data_coercion:to_existing_atom("all"),
+    ok.
+
+data_coercion_to_existing_atom_rejects_unknown(_Config) ->
+    ?assertError(badarg,
+                 rabbit_data_coercion:to_existing_atom(<<"xyzzy_not_an_atom_42">>)),
+    ?assertError(badarg,
+                 rabbit_data_coercion:to_existing_atom(<<"fabricated_node@host">>)),
+    ?assertError(badarg,
+                 rabbit_data_coercion:to_existing_atom("xyzzy_not_an_atom_42")),
+    ok.
+
+data_coercion_to_existing_atom_passthrough(_Config) ->
+    hello = rabbit_data_coercion:to_existing_atom(hello),
+    true  = rabbit_data_coercion:to_existing_atom(true),
+    ok.
+
+data_coercion_to_existing_atom_does_not_create_atoms(_Config) ->
+    CountBefore = erlang:system_info(atom_count),
+    InvalidInputs = [<<"abc_made_up_", (integer_to_binary(I))/binary>>
+                     || I <- lists:seq(1, 10_000)],
+    lists:foreach(
+      fun(Bin) ->
+              catch rabbit_data_coercion:to_existing_atom(Bin)
+      end, InvalidInputs),
+    CountAfter = erlang:system_info(atom_count),
+    ?assert(CountAfter - CountBefore =< 50),
+    ok.
+
+data_coercion_to_boolean(_Config) ->
+    %% For booleans, this is an identity function
+    ?assertEqual(true, rabbit_data_coercion:to_boolean(true)),
+    ?assertEqual(false, rabbit_data_coercion:to_boolean(false)),
+    %% Strings (lists) are converted regardless of their case
+    ?assertEqual(true, rabbit_data_coercion:to_boolean("true")),
+    ?assertEqual(true, rabbit_data_coercion:to_boolean("TRUE")),
+    ?assertEqual(true, rabbit_data_coercion:to_boolean("True")),
+    ?assertEqual(false, rabbit_data_coercion:to_boolean("false")),
+    ?assertEqual(false, rabbit_data_coercion:to_boolean("FALSE")),
+    ?assertEqual(false, rabbit_data_coercion:to_boolean("False")),
+    %% Binaries are also converted regardless of their case
+    ?assertEqual(true, rabbit_data_coercion:to_boolean(<<"true">>)),
+    ?assertEqual(true, rabbit_data_coercion:to_boolean(<<"TRUE">>)),
+    ?assertEqual(true, rabbit_data_coercion:to_boolean(<<"True">>)),
+    ?assertEqual(false, rabbit_data_coercion:to_boolean(<<"false">>)),
+    ?assertEqual(false, rabbit_data_coercion:to_boolean(<<"FALSE">>)),
+    ?assertEqual(false, rabbit_data_coercion:to_boolean(<<"False">>)).
+
+data_coercion_to_list(_Config) ->
+    %% Lists pass through unchanged
+    ?assertEqual([{a, 1}], rabbit_data_coercion:to_list([{a, 1}])),
+    %% Maps are converted to proplists
+    ?assertEqual([{a, 1}], rabbit_data_coercion:to_list(#{a => 1})),
+    %% Atoms are converted to strings
+    ?assertEqual("hello", rabbit_data_coercion:to_list(hello)),
+    %% Binaries are converted to strings
+    ?assertEqual("hello", rabbit_data_coercion:to_list(<<"hello">>)),
+    %% Integers are converted to strings
+    ?assertEqual("42", rabbit_data_coercion:to_list(42)),
+    %% IPv4 address tuples
+    IPv4 = {192, 168, 1, 1},
+    IPv4Result = rabbit_data_coercion:to_list(IPv4),
+    ?assert(is_list(IPv4Result)),
+    %% IPv6 address tuples
+    IPv6 = {0, 0, 0, 0, 0, 0, 0, 1},
+    IPv6Result = rabbit_data_coercion:to_list(IPv6),
+    ?assert(is_list(IPv6Result)).
+
+data_coercion_as_list(_Config) ->
+    %% Lists pass through unchanged
+    ?assertEqual([], rabbit_data_coercion:as_list([])),
+    ?assertEqual([a, b, c], rabbit_data_coercion:as_list([a, b, c])),
+    ?assertEqual([[1, 2], [3, 4]], rabbit_data_coercion:as_list([[1, 2], [3, 4]])),
+    %% Non-list values are wrapped in a list
+    ?assertEqual([foo], rabbit_data_coercion:as_list(foo)),
+    ?assertEqual([<<"hello">>], rabbit_data_coercion:as_list(<<"hello">>)),
+    ?assertEqual([42], rabbit_data_coercion:as_list(42)),
+    ?assertEqual([{a, b}], rabbit_data_coercion:as_list({a, b})),
+    ?assertEqual([#{a => 1}], rabbit_data_coercion:as_list(#{a => 1})),
+    Pid = self(),
+    ?assertEqual([Pid], rabbit_data_coercion:as_list(Pid)).
+
+data_coercion_to_binary(_Config) ->
+    ?assertEqual(<<"hello">>, rabbit_data_coercion:to_binary(<<"hello">>)),
+    ?assertEqual(<<"hello">>, rabbit_data_coercion:to_binary("hello")),
+    ?assertEqual(<<"foo">>, rabbit_data_coercion:to_binary(foo)),
+    ?assertEqual(<<"42">>, rabbit_data_coercion:to_binary(42)),
+    F = fun() -> ok end,
+    ?assert(is_binary(rabbit_data_coercion:to_binary(F))).
+
+data_coercion_to_binary_rejects_unsupported_types(_Config) ->
+    ?assertError(function_clause, rabbit_data_coercion:to_binary(#{a => 1})),
+    ?assertError(function_clause, rabbit_data_coercion:to_binary({a, b})),
+    ?assertError(function_clause, rabbit_data_coercion:to_binary(self())).
+
+data_coercion_to_map_recursive_proplist(_Config) ->
+    ?assertEqual(#{a => 1, b => 2},
+                 to_map_recursive([{a, 1}, {b, 2}])),
+    ?assertEqual(#{a => 1},
+                 to_map_recursive(#{a => 1})).
+
+data_coercion_to_map_recursive_nested_proplist(_Config) ->
+    Input = [{pattern, <<"^amq\\.">>},
+             {definition, [{expires, 1800000}, {ttl, 60000}]},
+             {priority, 1}],
+    Expected = #{pattern => <<"^amq\\.">>,
+                 definition => #{expires => 1800000, ttl => 60000},
+                 priority => 1},
+    ?assertEqual(Expected, to_map_recursive(Input)).
+
+data_coercion_to_map_recursive_mixed_structures(_Config) ->
+    Input = [{vhost, <<"/">>},
+             {upstreams, [[{uri, <<"amqp://server1">>}],
+                          [{uri, <<"amqp://server2">>}]]}],
+    Expected = #{vhost => <<"/">>,
+                 upstreams => [#{uri => <<"amqp://server1">>},
+                               #{uri => <<"amqp://server2">>}]},
+    ?assertEqual(Expected, to_map_recursive(Input)).
+
+data_coercion_to_map_recursive_bare_atoms(_Config) ->
+    Input = [{durable, true}, auto_delete, {exclusive, false}],
+    Expected = #{durable => true, auto_delete => true, exclusive => false},
+    ?assertEqual(Expected, to_map_recursive(Input)).
+
+data_coercion_to_map_recursive_empty_list(_Config) ->
+    ?assertEqual([], to_map_recursive([])).
+
+data_coercion_to_map_recursive_list_of_maps(_Config) ->
+    Input = [#{a => 1}, #{b => 2}, #{c => [{nested, 3}]}],
+    Expected = [#{a => 1}, #{b => 2}, #{c => #{nested => 3}}],
+    ?assertEqual(Expected, to_map_recursive(Input)).
+
+data_coercion_to_map_recursive_deep_nesting(_Config) ->
+    Input = [{level1, [{level2, [{level3, [{level4, value}]}]}]}],
+    Expected = #{level1 => #{level2 => #{level3 => #{level4 => value}}}},
+    ?assertEqual(Expected, to_map_recursive(Input)).
+
+data_coercion_to_map_recursive_atomic_values(_Config) ->
+    ?assertEqual(42, to_map_recursive(42)),
+    ?assertEqual(<<"binary">>, to_map_recursive(<<"binary">>)),
+    ?assertEqual(atom, to_map_recursive(atom)),
+    ?assertEqual("string", to_map_recursive("string")).
+
+data_coercion_to_map_recursive_binary_keys(_Config) ->
+    Input = [{<<"apply-to">>, <<"queues">>},
+             {<<"pattern">>, <<"^abc">>},
+             {<<"definition">>, [{<<"expires">>, 1800000}]}],
+    Expected = #{<<"apply-to">> => <<"queues">>,
+                 <<"pattern">> => <<"^abc">>,
+                 <<"definition">> => #{<<"expires">> => 1800000}},
+    ?assertEqual(Expected, to_map_recursive(Input)).
+
+data_coercion_to_map_recursive_atom_list_limitation(_Config) ->
+    Input = [admin, monitoring],
+    Expected = #{admin => true, monitoring => true},
+    ?assertEqual(Expected, to_map_recursive(Input)).
+
+pget(_Config) ->
+    ?assertEqual(1, rabbit_misc:pget(a, [{a, 1}])),
+    ?assertEqual(undefined, rabbit_misc:pget(b, [{a, 1}])),
+
+    ?assertEqual(1, rabbit_misc:pget(a, #{a => 1})),
+    ?assertEqual(undefined, rabbit_misc:pget(b, #{a => 1})).
+
+deep_pget(_Config) ->
+    ?assertEqual(1, rabbit_misc:deep_pget([p, p], [{p, [{p, 1}]}])),
+    ?assertEqual(1, rabbit_misc:deep_pget([m, p], #{m => [{p, 1}]})),
+    ?assertEqual(1, rabbit_misc:deep_pget([p, m], [{p, #{m => 1}}])),
+    ?assertEqual(1, rabbit_misc:deep_pget([m, m], #{m => #{m => 1}})),
+
+    ?assertEqual(undefined, rabbit_misc:deep_pget([p, x], [{p, [{p, 1}]}])),
+    ?assertEqual(undefined, rabbit_misc:deep_pget([m, x], #{m => [{p, 1}]})),
+    ?assertEqual(undefined, rabbit_misc:deep_pget([p, x], [{p, #{m => 1}}])),
+    ?assertEqual(undefined, rabbit_misc:deep_pget([m, x], #{m => #{m => 1}})),
+
+    ?assertEqual(undefined, rabbit_misc:deep_pget([x, p], [{p, [{p, 1}]}])),
+    ?assertEqual(undefined, rabbit_misc:deep_pget([x, p], #{m => [{p, 1}]})),
+    ?assertEqual(undefined, rabbit_misc:deep_pget([x, m], [{p, #{m => 1}}])),
+    ?assertEqual(undefined, rabbit_misc:deep_pget([x, m], #{m => #{m => 1}})).
+
+pid_decompose_compose(_Config) ->
+    Pid = self(),
+    {Node, Cre, Id, Ser} = rabbit_misc:decompose_pid(Pid),
+    Node = node(Pid),
+    Pid = rabbit_misc:compose_pid(Node, Cre, Id, Ser),
+    OtherNode = 'some_node@localhost',
+    PidOnOtherNode = rabbit_misc:pid_change_node(Pid, OtherNode),
+    {OtherNode, Cre, Id, Ser} = rabbit_misc:decompose_pid(PidOnOtherNode).
+
+encrypt_decrypt(_Config) ->
+    %% Take all available block ciphers.
+    Hashes = rabbit_pbe:supported_hashes() -- ?SKIPPED_HASHES,
+    Ciphers = rabbit_pbe:supported_ciphers() -- ?SKIPPED_CIPHERS,
+    %% For each cipher, try to encrypt and decrypt data sizes from 0 to 64 bytes
+    %% with a random passphrase.
+    _ = [begin
+             PassPhrase = crypto:strong_rand_bytes(16),
+             Iterations = rand:uniform(100),
+             Data = crypto:strong_rand_bytes(64),
+             [begin
+                  Expected = binary:part(Data, 0, Len),
+                  Enc = rabbit_pbe:encrypt(C, H, Iterations, PassPhrase, Expected),
+                  Expected = iolist_to_binary(rabbit_pbe:decrypt(C, H, Iterations, PassPhrase, Enc))
+              end || Len <- lists:seq(0, byte_size(Data))]
+         end || H <- Hashes, C <- Ciphers],
+    ok.
+
+encrypt_decrypt_term(_Config) ->
+    %% Take all available block ciphers.
+    Hashes = rabbit_pbe:supported_hashes() -- ?SKIPPED_HASHES,
+    Ciphers = rabbit_pbe:supported_ciphers() -- ?SKIPPED_CIPHERS,
+    %% Different Erlang terms to try encrypting.
+    DataSet = [
+        10000,
+        [5672],
+        [{"127.0.0.1", 5672},
+            {"::1",       5672}],
+        [{connection, info}, {channel, info}],
+        [{cacertfile,           "/path/to/testca/cacert.pem"},
+            {certfile,             "/path/to/server/cert.pem"},
+            {keyfile,              "/path/to/server/key.pem"},
+            {verify,               verify_peer},
+            {fail_if_no_peer_cert, false}],
+        [<<".*">>, <<".*">>, <<".*">>]
+    ],
+    _ = [begin
+             PassPhrase = crypto:strong_rand_bytes(16),
+             Iterations = rand:uniform(100),
+             Enc = rabbit_pbe:encrypt_term(C, H, Iterations, PassPhrase, Data),
+             Data = rabbit_pbe:decrypt_term(C, H, Iterations, PassPhrase, Enc)
+         end || H <- Hashes, C <- Ciphers, Data <- DataSet],
+    ok.
+
+frame_encoding_does_not_fail_with_empty_binary_payload(_Config) ->
+    [begin
+         Content = #content{
+             class_id = 60, properties = none, properties_bin = <<0,0>>,
+             payload_fragments_rev = P
+         },
+         ExpectedFrames = rabbit_binary_generator:build_simple_content_frames(1, Content, 0)
+     end || {P, ExpectedFrames} <- [
+                    {[], [[<<2,0,1,0,0,0,14>>,[<<0,60,0,0,0,0,0,0,0,0,0,0>>,<<0,0>>],206]]},
+                    {[<<>>], [[<<2,0,1,0,0,0,14>>,[<<0,60,0,0,0,0,0,0,0,0,0,0>>,<<0,0>>],206]]},
+                    {[<<"payload">>], [[<<2,0,1,0,0,0,14>>,[<<0,60,0,0,0,0,0,0,0,0,0,7>>,<<0,0>>],206],
+                                       [<<3,0,1,0,0,0,7>>,[<<"payload">>],206]]}
+                    ]],
+    ok.
+
+map_exception_does_not_fail_with_unicode_explaination_case1(_Config) ->
+    NonAsciiExplaination = "no queue 'non_ascii_name_😍_你好' in vhost '/'",
+    rabbit_binary_generator:map_exception(0,
+        #amqp_error{name = not_found, explanation = NonAsciiExplaination, method = 'queue.declare'}),
+    ok.
+
+map_exception_does_not_fail_with_unicode_explaination_case2(_Config) ->
+    NonAsciiExplaination = "no queue 'кролик 🐰' in vhost '/'",
+    rabbit_binary_generator:map_exception(0,
+        #amqp_error{name = not_found, explanation = NonAsciiExplaination, method = 'queue.declare'}),
+    ok.
+
+amqp_table_conversion(_Config) ->
+    assert_table(#{}, []),
+    assert_table(#{<<"x-expires">> => 1000},
+                 [{<<"x-expires">>, long, 1000}]),
+    assert_table(#{<<"x-forwarding">> =>
+                   [#{<<"uri">> => <<"amqp://localhost/%2F/upstream">>}]},
+                 [{<<"x-forwarding">>, array,
+                   [{table, [{<<"uri">>, longstr,
+                              <<"amqp://localhost/%2F/upstream">>}]}]}]).
+
+assert_table(JSON, AMQP) ->
+    ?assertEqual(JSON, rabbit_misc:amqp_table(AMQP)),
+    ?assertEqual(AMQP, rabbit_misc:to_amqp_table(JSON)).
+
+
+set_stats_interval(Interval) ->
+    application:set_env(rabbit, collect_statistics, coarse),
+    application:set_env(rabbit, collect_statistics_interval, Interval).
+
+reset_stats_interval() ->
+    application:unset_env(rabbit, collect_statistics),
+    application:unset_env(rabbit, collect_statistics_interval).
+
+name_type(_) ->
+    ?assertEqual(shortnames, rabbit_nodes_common:name_type(rabbit)),
+    ?assertEqual(shortnames, rabbit_nodes_common:name_type(rabbit@localhost)),
+    ?assertEqual(longnames, rabbit_nodes_common:name_type('rabbit@localhost.example.com')),
+    ok.
+
+get_erl_path(_) ->
+    Exe = rabbit_runtime:get_erl_path(),
+    case os:type() of
+        {win32, _} ->
+            ?assertNotMatch(nomatch, string:find(Exe, "erl.exe"));
+        _ ->
+            ?assertNotMatch(nomatch, string:find(Exe, "erl"))
+    end,
+    ok.
+
+hexify(_) ->
+    ?assertEqual(<<"68656C6C6F">>, rabbit_misc:hexify(<<"hello">>)),
+    ?assertEqual(<<"68656C6C6F">>, rabbit_misc:hexify("hello")),
+    ?assertEqual(<<"68656C6C6F">>, rabbit_misc:hexify(hello)),
+    ok.
+
+date_time_parse_duration(_) ->
+    ?assertEqual(
+        {ok, [{sign, "+"}, {years, 6}, {months, 3}, {days, 1}, {hours, 1}, {minutes, 1}, {seconds, 1}]},
+        rabbit_date_time:parse_duration("+P6Y3M1DT1H1M1.1S")
+    ),
+    ?assertEqual(
+        {ok, [{sign, []}, {years, 0}, {months, 0}, {days, 0}, {hours, 0}, {minutes, 6}, {seconds, 0}]},
+        rabbit_date_time:parse_duration("PT6M")
+    ),
+    ?assertEqual(
+        {ok, [{sign, []}, {years, 0}, {months, 0}, {days, 0}, {hours, 0}, {minutes, 10}, {seconds, 30}]},
+        rabbit_date_time:parse_duration("PT10M30S")
+    ),
+    ?assertEqual(
+        {ok, [{sign, []}, {years, 0}, {months, 0}, {days, 5}, {hours, 8}, {minutes, 0}, {seconds, 0}]},
+        rabbit_date_time:parse_duration("P5DT8H")
+    ),
+    ?assertEqual(error, rabbit_date_time:parse_duration("foo")),
+    ok.
+
+date_time_in_the_past(_) ->
+    {Year, Month, Day} = rabbit_date_time:today(),
+
+    ?assertEqual(false, rabbit_date_time:is_in_the_past({Year + 1, Month, Day})),
+    ?assertEqual(true,  rabbit_date_time:is_in_the_past({Year - 3, Month, Day})).

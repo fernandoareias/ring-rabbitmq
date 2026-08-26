@@ -1,0 +1,162 @@
+%% This Source Code Form is subject to the terms of the Mozilla Public
+%% License, v. 2.0. If a copy of the MPL was not distributed with this
+%% file, You can obtain one at https://mozilla.org/MPL/2.0/.
+%%
+%% Copyright (c) 2007-2026 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
+%%
+
+-module(web_mqtt_system_SUITE).
+
+-include_lib("eunit/include/eunit.hrl").
+
+-compile([export_all, nowarn_export_all]).
+
+-import(rabbit_ct_helpers, [eventually/1]).
+
+all() ->
+    [{group, tests}].
+
+groups() ->
+    [
+     {tests, [],
+      [no_websocket_subprotocol
+       ,unsupported_websocket_subprotocol
+       ,unacceptable_data_type
+       ,handle_invalid_packets
+       ,duplicate_connect
+       ,wss_http2
+      ]}
+    ].
+
+suite() ->
+    [{timetrap, {minutes, 2}}].
+
+init_per_suite(Config) ->
+    rabbit_ct_helpers:log_environment(),
+    Config1 = rabbit_ct_helpers:set_config(Config, [
+        {rmq_nodename_suffix, ?MODULE},
+        {protocol, "ws"}
+      ]),
+    Config2 = rabbit_ct_helpers:run_setup_steps(Config1),
+    {rmq_certsdir, CertsDir} = proplists:lookup(rmq_certsdir, Config2),
+    Config3 = rabbit_ct_helpers:merge_app_env(
+                Config2,
+                {rabbitmq_web_mqtt,
+                 [{ssl_config,
+                   [{cacertfile, filename:join([CertsDir, "testca", "cacert.pem"])},
+                    {certfile, filename:join([CertsDir, "server", "cert.pem"])},
+                    {keyfile, filename:join([CertsDir, "server", "key.pem"])},
+                    %% We only want to ensure HTTP/2 Websocket is working.
+                    {fail_if_no_peer_cert, false},
+                    {versions, ['tlsv1.3']},
+                    %% We hard code this port number here because it will be computed later by
+                    %% rabbit_ct_broker_helpers:init_tcp_port_numbers/3 when we start the broker.
+                    %% (The alternative is to first start the broker, stop the rabbitmq_web_amqp app,
+                    %% configure tls_config, and then start the app again.)
+                    {port, 21010}
+                   ]}]}),
+    rabbit_ct_helpers:run_setup_steps(Config3,
+      rabbit_ct_broker_helpers:setup_steps() ++
+      rabbit_ct_client_helpers:setup_steps()).
+
+end_per_suite(Config) ->
+    rabbit_ct_helpers:run_teardown_steps(Config,
+      rabbit_ct_client_helpers:teardown_steps() ++
+      rabbit_ct_broker_helpers:teardown_steps()).
+
+init_per_group(_, Config) ->
+    Config.
+
+end_per_group(_, Config) ->
+    Config.
+
+init_per_testcase(Testcase, Config) ->
+    rabbit_ct_helpers:testcase_started(Config, Testcase).
+
+end_per_testcase(Testcase, Config) ->
+    rabbit_ct_helpers:testcase_finished(Config, Testcase).
+
+%% -------------------------------------------------------------------
+%% Testsuite cases
+%% -------------------------------------------------------------------
+
+no_websocket_subprotocol(Config) ->
+    websocket_subprotocol(Config, []).
+
+unsupported_websocket_subprotocol(Config) ->
+    websocket_subprotocol(Config, ["not-mqtt-protocol"]).
+
+%% "The client MUST include “mqtt” in the list of WebSocket Sub Protocols it offers" [MQTT-6.0.0-3].
+websocket_subprotocol(Config, SubProtocol) ->
+    PortStr = rabbit_ws_test_util:get_web_mqtt_port_str(Config),
+    WS = rfc6455_client:new("ws://localhost:" ++ PortStr ++ "/ws", self(), undefined, SubProtocol),
+    {_, [{http_response, Res}]} = rfc6455_client:open(WS),
+    {'HTTP/1.1', 400, <<"Bad Request">>, _} = cow_http:parse_status_line(rabbit_data_coercion:to_binary(Res)),
+    rfc6455_client:send_binary(WS, rabbit_ws_test_util:mqtt_3_1_1_connect_packet()),
+    {close, _} = rfc6455_client:recv(WS, timer:seconds(1)).
+
+%% "MQTT Control Packets MUST be sent in WebSocket binary data frames. If any other type
+%% of data frame is received the recipient MUST close the Network Connection" [MQTT-6.0.0-1].
+unacceptable_data_type(Config) ->
+    PortStr = rabbit_ws_test_util:get_web_mqtt_port_str(Config),
+    WS = rfc6455_client:new("ws://localhost:" ++ PortStr ++ "/ws", self(), undefined, ["mqtt"]),
+    {ok, _} = rfc6455_client:open(WS),
+    rfc6455_client:send(WS, "not-binary-data"),
+    {close, {1003, _}} = rfc6455_client:recv(WS, timer:seconds(1)).
+
+handle_invalid_packets(Config) ->
+    PortStr = rabbit_ws_test_util:get_web_mqtt_port_str(Config),
+    WS = rfc6455_client:new("ws://localhost:" ++ PortStr ++ "/ws", self(), undefined, ["mqtt"]),
+    {ok, _} = rfc6455_client:open(WS),
+    Bin = <<"GET / HTTP/1.1\r\nHost: www.rabbitmq.com\r\nUser-Agent: curl/7.43.0\r\nAccept: */*">>,
+    rfc6455_client:send_binary(WS, Bin),
+    {close, {1002, _}} = rfc6455_client:recv(WS, timer:seconds(1)).
+
+%% "A Client can only send the CONNECT Packet once over a Network Connection.
+%% The Server MUST process a second CONNECT Packet sent from a Client as a protocol
+%% violation and disconnect the Client [MQTT-3.1.0-2].
+duplicate_connect(Config) ->
+    Url = "ws://127.0.0.1:" ++ rabbit_ws_test_util:get_web_mqtt_port_str(Config) ++ "/ws",
+    WS = rfc6455_client:new(Url, self(), undefined, ["mqtt"]),
+    {ok, _} = rfc6455_client:open(WS),
+
+    %% 1st CONNECT should succeed.
+    rfc6455_client:send_binary(WS, rabbit_ws_test_util:mqtt_3_1_1_connect_packet()),
+    {binary, _P} = rfc6455_client:recv(WS),
+    eventually(?_assertEqual(1, num_mqtt_connections(Config, 0))),
+
+    %% 2nd CONNECT should fail.
+    process_flag(trap_exit, true),
+    rfc6455_client:send_binary(WS, rabbit_ws_test_util:mqtt_3_1_1_connect_packet()),
+    eventually(?_assertEqual(0, num_mqtt_connections(Config, 0))),
+    receive {'EXIT', WS, _} -> ok
+    after 500 -> ct:fail("expected web socket to exit")
+    end.
+
+wss_http2(Config) ->
+    {ok, _} = application:ensure_all_started(gun),
+    Port = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_web_mqtt_tls),
+    {ok, ConnPid} = gun:open("localhost", Port, #{
+        transport => tls,
+        tls_opts => [{verify, verify_none}],
+        protocols => [http2],
+        http2_opts => #{notify_settings_changed => true},
+        ws_opts => #{protocols => [{<<"mqtt">>, gun_ws_h}]}
+    }),
+    {ok, http2} = gun:await_up(ConnPid),
+    {notify, settings_changed, #{enable_connect_protocol := true}}
+        = gun:await(ConnPid, undefined),
+    StreamRef = gun:ws_upgrade(ConnPid, "/ws", []),
+    {upgrade, [<<"websocket">>], _} = gun:await(ConnPid, StreamRef),
+    gun:ws_send(ConnPid, StreamRef, {binary, rabbit_ws_test_util:mqtt_3_1_1_connect_packet()}),
+    {ws, {binary, _P}} = gun:await(ConnPid, StreamRef),
+    eventually(?_assertEqual(1, num_mqtt_connections(Config, 0))),
+    ok.
+
+%% -------------------------------------------------------------------
+%% Internal helpers
+%% -------------------------------------------------------------------
+
+%% Web mqtt connections are tracked together with mqtt connections
+num_mqtt_connections(Config, Node) ->
+    length(rabbit_ct_broker_helpers:rpc(Config, Node, rabbit_mqtt, local_connection_pids, [])).

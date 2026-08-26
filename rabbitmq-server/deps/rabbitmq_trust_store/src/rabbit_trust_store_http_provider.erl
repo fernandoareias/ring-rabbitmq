@@ -1,0 +1,117 @@
+%% This Source Code Form is subject to the terms of the Mozilla Public
+%% License, v. 2.0. If a copy of the MPL was not distributed with this
+%% file, You can obtain one at https://mozilla.org/MPL/2.0/.
+%%
+%% Copyright (c) 2007-2026 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
+%%
+
+-module(rabbit_trust_store_http_provider).
+
+-include_lib("kernel/include/logger.hrl").
+
+
+-behaviour(rabbit_trust_store_certificate_provider).
+
+-define(PROFILE, ?MODULE).
+
+-export([list_certs/1, list_certs/2, load_cert/3]).
+
+-record(http_state,{
+    url :: string(),
+    http_options :: list(),
+    headers :: [{[byte()], binary() | iolist()}]
+}).
+
+list_certs(Config) ->
+    _ = init(Config),
+    State = init_state(Config),
+    list_certs(Config, State).
+
+list_certs(_, #http_state{url = Url,
+                          http_options = HttpOptions,
+                          headers = Headers} = State) ->
+    case (httpc:request(get, {Url, Headers}, HttpOptions, [{body_format, binary}], ?PROFILE)) of
+        {ok, {{_, 200, _}, RespHeaders, Body}} ->
+            ?LOG_DEBUG("Trust store HTTP[S] provider responded with 200 OK"),
+            Certs = decode_cert_list(Body),
+            NewState = new_state(RespHeaders, State),
+            {ok, Certs, NewState};
+        {ok, {{_,304, _}, _, _}}  -> no_change;
+        {ok, {{_,Code,_}, _, Body}} -> {error, {http_error, Code, Body}};
+        {error, Reason} ->
+            ?LOG_ERROR("Trust store HTTP[S] provider request failed: ~tp", [Reason]),
+            {error, Reason}
+    end.
+
+load_cert(_, Attributes, Config) ->
+    CertPath = proplists:get_value(path, Attributes),
+    #http_state{url = BaseUrl,
+                http_options = HttpOptions,
+                headers = Headers} = init_state(Config),
+    Url = join_url(BaseUrl, CertPath),
+    Res = httpc:request(get,
+                        {Url, Headers},
+                        HttpOptions,
+                        [{body_format, binary}, {full_result, false}],
+                        ?PROFILE),
+    case Res of
+        {ok, {200, Body}} ->
+            [{'Certificate', Cert, not_encrypted}] = public_key:pem_decode(Body),
+            {ok, Cert};
+        {ok, {Code, Body}} -> {error, {http_error, Code, Body}};
+        {error, Reason}    -> {error, Reason}
+    end.
+
+join_url(BaseUrl, CertPath)  ->
+    string:strip(rabbit_data_coercion:to_list(BaseUrl), right, $/)
+    ++ "/" ++
+    string:strip(rabbit_data_coercion:to_list(CertPath), left, $/).
+
+init(Config) ->
+    _ = inets:start(httpc, [{profile, ?PROFILE}]),
+    {ok, _} = application:ensure_all_started(ssl),
+    Options = proplists:get_value(proxy_options, Config, []),
+    httpc:set_options(Options, ?PROFILE).
+
+init_state(Config) ->
+    Url = proplists:get_value(url, Config),
+    Headers = proplists:get_value(http_headers, Config, []),
+    Timeout = https_request_timeout(),
+    HttpOptions0 = [{timeout, Timeout}, {connect_timeout, Timeout}],
+    HttpOptions = case proplists:get_value(ssl_options, Config) of
+        undefined -> HttpOptions0;
+        SslOpts   -> [{ssl, SslOpts} | HttpOptions0]
+    end,
+    #http_state{url = Url, http_options = HttpOptions, headers = [{"connection", "close"} | Headers]}.
+
+https_request_timeout() ->
+    application:get_env(rabbitmq_trust_store, https_request_timeout, 20000).
+
+decode_cert_list(Body) ->
+    try
+        Struct = rabbit_json:decode(Body),
+        #{<<"certificates">> := Certs} = Struct,
+        lists:map(
+            fun(Cert) ->
+                Path = maps:get(<<"path">>, Cert),
+                CertId = maps:get(<<"id">>, Cert),
+                {CertId, [{path, Path}]}
+            end, Certs)
+    catch _:badarg ->
+            ?LOG_ERROR("Trust store failed to decode an HTTP[S] response: JSON parser failed"),
+            [];
+          _:Error ->
+            ?LOG_ERROR("Trust store failed to decode an HTTP[S] response: ~tp", [Error]),
+            []
+    end.
+
+new_state(RespHeaders, #http_state{headers = Headers0} = State) ->
+    LastModified0 = proplists:get_value("last-modified", RespHeaders),
+    LastModified1 = proplists:get_value("Last-Modified", RespHeaders, LastModified0),
+    case LastModified1 of
+        undefined -> State;
+        Value     ->
+            Headers1 = lists:ukeysort(1, Headers0),
+            NewHeaders = lists:ukeymerge(1, [{"If-Modified-Since", Value}], Headers1),
+            State#http_state{headers = NewHeaders}
+    end.

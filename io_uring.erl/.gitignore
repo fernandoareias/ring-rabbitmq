@@ -1,0 +1,20 @@
+# rebar3 build artifacts
+_build/
+
+# Compiled NIF shared library
+priv/*.so
+priv/*.dll
+
+# Erlang bytecode
+ebin/*.beam
+
+# rebar3 crash dumps and logs
+erl_crash.dump
+rebar3.crashdump
+
+# Editor artifacts
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

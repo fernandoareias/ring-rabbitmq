@@ -1,0 +1,123 @@
+%% This Source Code Form is subject to the terms of the Mozilla Public
+%% License, v. 2.0. If a copy of the MPL was not distributed with this
+%% file, You can obtain one at https://mozilla.org/MPL/2.0/.
+%%
+%% Copyright (c) 2007-2026 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
+%%
+
+-module(rabbit_federation_queue_link_sup_sup).
+
+-behaviour(mirrored_supervisor).
+
+-include_lib("rabbit_common/include/rabbit.hrl").
+-include_lib("rabbit/include/amqqueue.hrl").
+-include("rabbit_queue_federation.hrl").
+-include_lib("kernel/include/logger.hrl").
+-define(SUPERVISOR, ?MODULE).
+
+%% Supervises the upstream links for all queues (but not exchanges). We need
+%% different handling here since queues do not want a mirrored sup.
+
+-export([start_link/0, start_child/1, adjust/1, stop_child/1]).
+-export([init/1]).
+-export([id_to_khepri_path/1]).
+
+%%----------------------------------------------------------------------------
+
+start_link() ->
+    _ = pg:start_link(),
+    %% This scope is used by concurrently starting exchange and queue links,
+    %% and other places, so we have to start it very early outside of the supervision tree.
+    %% The scope is stopped in stop/1.
+    _ = rabbit_federation_pg:start_scope(?FEDERATION_PG_SCOPE),
+    rabbit_federation_app_state:reset_shutting_down_marker(),
+    mirrored_supervisor:start_link({local, ?SUPERVISOR}, ?SUPERVISOR,
+                                   ?MODULE, []).
+
+%% Note that the next supervisor down, rabbit_federation_link_sup, is common
+%% between exchanges and queues.
+start_child(Q) ->
+    try mirrored_supervisor:start_child(
+           ?SUPERVISOR,
+           {id(Q), {rabbit_federation_link_sup, start_link, [rabbit_federation_queue_link, Q]},
+            transient, ?SUPERVISOR_WAIT, supervisor,
+            [rabbit_federation_link_sup]}) of
+        {ok, _Pid}               -> ok;
+        {error, {already_started, _Pid}} ->
+          QueueName = amqqueue:get_name(Q),
+          ?LOG_WARNING("Federation link for queue ~tp was already started",
+                       [rabbit_misc:rs(QueueName)]),
+          ok;
+        %% A link returned {stop, gone}, the link_sup shut down, that's OK.
+        {error, {shutdown, _}} -> ok
+    catch
+        exit:{noproc, _} -> ok;
+        exit:{shutdown, _} -> ok;
+        exit:shutdown -> ok
+    end.
+
+
+adjust({clear_upstream, VHost, UpstreamName}) ->
+    _ = [rabbit_federation_link_sup:adjust(Pid, rabbit_federation_queue_link, Q, {clear_upstream, UpstreamName}) ||
+            {Q, Pid, _, _} <- which_children(),
+            ?amqqueue_vhost_equals(Q, VHost)],
+    ok;
+adjust(Reason) ->
+    _ = [rabbit_federation_link_sup:adjust(Pid, rabbit_federation_queue_link, Q, Reason) ||
+            {Q, Pid, _, _} <- which_children()],
+    ok.
+
+which_children() ->
+    try
+        mirrored_supervisor:which_children(?SUPERVISOR)
+    catch
+        exit:{noproc, _} -> [];
+        exit:{shutdown, _} -> [];
+        exit:shutdown -> []
+    end.
+
+stop_child(Q) ->
+    try mirrored_supervisor:terminate_child(?SUPERVISOR, id(Q)) of
+      ok -> ok;
+      {error, Err} ->
+        QueueName = amqqueue:get_name(Q),
+        ?LOG_WARNING("Attempt to stop a federation link for queue ~tp failed: ~tp",
+                     [rabbit_misc:rs(QueueName), Err]),
+        ok
+    catch
+        exit:{noproc, _} -> ok;
+        exit:{shutdown, _} -> ok;
+        exit:shutdown -> ok
+    end,
+    try
+        _ = mirrored_supervisor:delete_child(?SUPERVISOR, id(Q)),
+        ok
+    catch
+        exit:{noproc, _} -> ok;
+        exit:{shutdown, _} -> ok;
+        exit:shutdown -> ok
+    end.
+
+%%----------------------------------------------------------------------------
+
+init([]) ->
+    {ok, {{one_for_one, 1200, 60}, []}}.
+
+%% Clean out all mutable aspects of the queue except policy. We need
+%% to keep the entire queue around rather than just take its name
+%% since we will want to know its policy to determine how to federate
+%% it, and its immutable properties in case we want to redeclare it
+%% upstream. We don't just take its name and look it up again since
+%% that would introduce race conditions when policies change
+%% frequently.  Note that since we take down all the links and start
+%% again when policies change, the policy will always be correct, so
+%% we don't clear it out here and can trust it.
+id(Q) when ?is_amqqueue(Q) ->
+    Policy = amqqueue:get_policy(Q),
+    Q1 = amqqueue:set_immutable(Q),
+    Q2 = amqqueue:set_policy(Q1, Policy),
+    Q2.
+
+id_to_khepri_path(Id) when ?is_amqqueue(Id) ->
+    #resource{virtual_host = VHost, name = Name} = amqqueue:get_name(Id),
+    [queue, VHost, Name].

@@ -1,0 +1,10 @@
+{application, io_uring, [
+    {description, "Erlang NIF bindings for Linux io_uring"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {applications, [kernel, stdlib]},
+    {env, []},
+    {modules, []},
+    {licenses, ["MIT"]},
+    {links, [{"GitHub", "https://github.com/fernandoareias/io_uring.erl"}]}
+]}.
